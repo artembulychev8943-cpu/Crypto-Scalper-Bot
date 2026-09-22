@@ -1,5 +1,5 @@
-ccxt==4.4.0
-pandas==2.2.2
+ccxt
+pandas
 pandas-ta==0.3.14b0
-schedule==1.2.2
-pyTelegramBotAPI==4.26.0
+schedule
+pyTelegramBotAPI
