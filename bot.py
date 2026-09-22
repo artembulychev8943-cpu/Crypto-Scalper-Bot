@@ -19,26 +19,16 @@ CHAT_ID = int(CHAT_ID_ENV)
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 def send_tg_message(text):
-    """Отправка сообщений в Telegram"""
     try:
         bot.send_message(CHAT_ID, text, parse_mode='Markdown')
     except Exception as e:
-        print(f"Ошибка отправки сообщения в Telegram: {e}")
-
-def handle_exception(exc_type, exc_value, exc_traceback):
-    """Перехват критических ошибок и отправка их владельцу"""
-    error_msg = f"❌ *Критический сбой бота на хостинге!*\n\nТип: {exc_type.__name__}\nОшибка: {exc_value}"
-    send_tg_message(error_msg)
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
-
-sys.excepthook = handle_exception
+        print(f"Ошибка отправки сообщения: {e}")
 
 # === НАСТРОЙКИ ТОРГОВОГО БОТА ===
 EXCHANGE_NAME = 'bybit'  
 TIMEFRAME = '5m'         
 CANDLE_LIMIT = 50        
 
-# Список из 20 ТОП-монет для мониторинга и массового бэктеста
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
     'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
@@ -46,7 +36,6 @@ SYMBOLS = [
     'ARB/USDT', 'OP/USDT', 'INJ/USDT', 'TIA/USDT', 'SUI/USDT'
 ]
 
-# Настройки индикаторов
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
@@ -55,11 +44,9 @@ MFI_PERIOD = 14
 MFI_OVERSOLD = 20
 MFI_OVERBOUGHT = 80
 
-# Риск-менеджмент
 TAKE_PROFIT_PCT = 0.03  
 STOP_LOSS_PCT = 0.015   
 
-# Распределение виртуального баланса
 START_TOTAL_BALANCE = 1000.0
 balance_per_coin = START_TOTAL_BALANCE / len(SYMBOLS)
 
@@ -68,7 +55,7 @@ positions = {symbol: None for symbol in SYMBOLS}
 
 exchange = getattr(ccxt, EXCHANGE_NAME)()
 
-# --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ИНДИKАТОРОВ (ЧИСТЫЙ PYTHON) ---
+# --- ЧИСТАЯ МАТЕМАТИКА ---
 def calculate_rsi_series(prices, period=14):
     deltas = pd.Series(prices).diff().dropna()
     gain = deltas.clip(lower=0)
@@ -91,117 +78,54 @@ def calculate_mfi_series(high, low, close, volume, period=14):
     m_ratio = pos_mf / neg_mf
     return 100 - (100 / (1 + m_ratio))
 
-# --- ОБРАБОТКА КОМАНД В ТЕЛЕГРАМ ---
+def get_market_data_single(symbol):
+    try:
+        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        rsi_s = calculate_rsi_series(df['close'], period=RSI_PERIOD)
+        mfi_s = calculate_mfi_series(df['high'], df['low'], df['close'], df['volume'], period=MFI_PERIOD)
+        latest = df.iloc[-1].copy()
+        latest['RSI'] = rsi_s.iloc[-1]
+        latest['MFI'] = mfi_s.iloc[-1]
+        return latest
+    except Exception:
+        return None
+
+# --- ТЕЛЕГРАМ КОМАНДЫ ---
 @bot.message_handler(commands=['start', 'balance'])
 def send_balance(message):
-    """Ответ на команду /balance"""
-    if message.chat.id == CHAT_ID:
-        report = "📊 *Текущий статус портфеля (Топ-20):*\n\n"
-        total_value = 0.0
-        active_trades = 0
-        
-        for symbol in SYMBOLS:
-            pos = positions[symbol]
-            if pos is None:
-                total_value += balances[symbol]
+    if message.chat.id != CHAT_ID:
+        return
+    report = "📊 *Текущий статус портфеля (Топ-20):*\n\n"
+    total_value = 0.0
+    for symbol in SYMBOLS:
+        pos = positions[symbol]
+        if pos is None:
+            total_value += balances[symbol]
+        else:
+            current_data = get_market_data_single(symbol)
+            if current_data is not None:
+                current_cost = pos['amount'] * current_data['close']
+                total_value += current_cost
+                report += f"🔸 *{symbol}:* В сделке! (\${current_cost:.2f})\n"
             else:
-                active_trades += 1
-                current_data = get_market_data_single(symbol)
-                if current_data is not None:
-                    current_price = current_data['close']
-                    entry_price = pos['entry_price']
-                    profit_pct = ((current_price - entry_price) / entry_price) * 100
-                    current_cost = pos['amount'] * current_price
-                    total_value += current_cost
-                    report += f"🔸 *{symbol}:* В сделке! Профит: {profit_pct:+.2f}% (\${current_cost:.2f})\n"
-                else:
-                    total_value += (pos['amount'] * pos['entry_price'])
-                    report += f"🔸 *{symbol}:* В сделке (связь ограничена)\n"
-                    
-        report += f"\n💼 Активных сделок: {active_trades} из {len(SYMBOLS)}\n"
-        report += f"💰 *Общая стоимость активов:* \${total_value:.2f}"
-        bot.reply_to(message, report, parse_mode='Markdown')
+                total_value += (pos['amount'] * pos['entry_price'])
+    report += f"\n💰 *Общая стоимость активов:* \${total_value:.2f}"
+    bot.reply_to(message, report, parse_mode='Markdown')
 
 @bot.message_handler(commands=['backtest'])
 def run_tg_backtest(message):
-    """Запуск бэктеста. /backtest [монета] или просто /backtest для всех 20 монет"""
     if message.chat.id != CHAT_ID:
         return
-
-    args = message.text.split()
+    bot.reply_to(message, f"⏳ Запущен глобальный бэктест по *{len(SYMBOLS)} монетам* за 3.5 дня. Считаю...", parse_mode='Markdown')
     
-    # Массовый бэктест по всему списку
-    if len(args) < 2 or args[1].lower() == 'all':
-        bot.reply_to(message, f"⏳ Запущен массовый бэктест по всем *{len(SYMBOLS)} монетам* за 3.5 дня. Подождите около 15 секунд...", parse_mode='Markdown')
-        
-        summary_report = "📊 *Глобальный бэктест (Топ-20 за 3.5 дня):*\n\n"
-        total_start_funds = len(SYMBOLS) * 1000.0
-        total_final_funds = 0.0
-        global_trades = 0
-        global_wins = 0
+    summary_report = "📊 *Глобальный бэктест (Топ-20 за 3.5 дня):*\n\n"
+    total_start_funds = len(SYMBOLS) * 1000.0
+    total_final_funds = 0.0
+    global_trades = 0
+    global_wins = 0
 
-        for symbol in SYMBOLS:
-            try:
-                bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
-                df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
-                df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
-                df_bt = df_bt.dropna().reset_index(drop=True)
-
-                bt_balance = 1000.0
-                bt_position = None
-
-                for i in range(len(df_bt)):
-                    c_price = df_bt.loc[i, 'close']
-                    rsi_val = df_bt.loc[i, 'RSI']
-                    mfi_val = df_bt.loc[i, 'MFI']
-
-                    if bt_position is None:
-                        if rsi_val < RSI_OVERSOLD and mfi_val < MFI_OVERSOLD:
-                            bt_position = {'entry_price': c_price, 'amount': bt_balance / c_price}
-                            bt_balance = 0.0
-                    else:
-                        e_price = bt_position['entry_price']
-                        amt = bt_position['amount']
-                        p_change = (c_price - e_price) / e_price
-
-                        if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
-                            bt_balance = amt * c_price
-                            global_trades += 1
-                            if p_change > 0:
-                                global_wins += 1
-                            bt_position = None
-
-                if bt_position is not None:
-                    bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
-
-                total_final_funds += bt_balance
-                profit_pct = ((bt_balance - 1000.0) / 1000.0) * 100
-                summary_report += f"🔹 *{symbol}:* {profit_pct:+.2f}%\n"
-
-            except Exception:
-                total_final_funds += 1000.0
-                summary_report += f"🔹 *{symbol}:* Ошибка данных ❌\n"
-            
-            time.sleep(0.3)
-
-        global_profit_pct = ((total_final_funds - total_start_funds) / total_start_funds) * 100
-        global_win_rate = (global_wins / global_trades * 100) if global_trades > 0 else 0
-
-        summary_report += f"\n📈 *Общий итог стратегии:*\n"
-        summary_report += f"💵 Финальный результат: {global_profit_pct:+.2f}%\n"
-        summary_report += f"🔄 Всего сделок по рынку: {global_trades}\n"
-        summary_report += f"🎯 Средний Win Rate: {global_win_rate:.1f}%"
-        
-        bot.send_message(CHAT_ID, summary_report, parse_mode='Markdown')
-        return
-
-    # Одиночный бэктест конкретной монеты
-    raw_symbol = args[1].upper()
-    symbol = raw_symbol if '/' in raw_symbol else f"{raw_symbol}/USDT"
-    bot.reply_to(message, f"⏳ Запущен бэктест для *{symbol}*...", parse_mode='Markdown')
-
-    try:
+    for symbol in SYMBOLS:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
         df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
@@ -210,8 +134,6 @@ def run_tg_backtest(message):
 
         bt_balance = 1000.0
         bt_position = None
-        total_trades = 0
-        win_trades = 0
 
         for i in range(len(df_bt)):
             c_price = df_bt.loc[i, 'close']
@@ -229,15 +151,65 @@ def run_tg_backtest(message):
 
                 if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
                     bt_balance = amt * c_price
-                    total_trades += 1
+                    global_trades += 1
                     if p_change > 0:
-                        win_trades += 1
+                        global_wins += 1
                     bt_position = None
 
         if bt_position is not None:
             bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
+            global_trades += 1
 
-        profit_pct = ((bt_balance - 1000.0) / 1000.0) * 100
-        win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0
+        total_final_funds += bt_balance
+        p_pct = ((bt_balance - 1000.0) / 1000.0) * 100
+        summary_report += f"🔹 {symbol}: {p_pct:+.2f}%\n"
+        time.sleep(0.3)
 
-        report = f"📊 *Результаты бэктеста для {symbol}:*\n\n💰 Стартовый баланс: \$1000.00\n💵 Финальный баланс: \${bt_balance:.2f}\n📈 Чистая прибыль: {profit_pct:+.2f}%\n🔄 Всего сделок: {total_trades}\n🎯 Win Rate: {win_rate:.1f}%"
+    g_profit_pct = ((total_final_funds - total_start_funds) / total_start_funds) * 100
+    g_win_rate = (global_wins / global_trades * 100) if global_trades > 0 else 0
+
+    summary_report += f"\n📈 *Общий итог стратегии:*\n💵 Результат: {g_profit_pct:+.2f}%\n🔄 Всего сделок: {global_trades}\n🎯 Win Rate: {g_win_rate:.1f}%"
+    bot.send_message(CHAT_ID, summary_report, parse_mode='Markdown')
+
+# --- РАБОТА РОБОТА В РЕАЛЬНОМ ВРЕМЕНИ ---
+def check_trade_logic():
+    global balances, positions
+    for symbol in SYMBOLS:
+        current_data = get_market_data_single(symbol)
+        if current_data is None:
+            continue
+        c_price = current_data['close']
+        rsi = current_data['RSI']
+        mfi = current_data['MFI']
+
+        if positions[symbol] is None:
+            if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD and balances[symbol] > 0:
+                positions[symbol] = {'entry_price': c_price, 'amount': balances[symbol] / c_price}
+                balances[symbol] = 0.0
+                msg = f"🛒 *ПОКУПКА {symbol}*\nЦена: {c_price}\nRSI: {rsi:.1f}, MFI: {mfi:.1f}"
+                send_tg_message(msg)
+        else:
+            pos = positions[symbol]
+            p_change = (c_price - pos['entry_price']) / pos['entry_price']
+            
+            if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT:
+                balances[symbol] = pos['amount'] * c_price
+                reason = "🟢 TP" if p_change > 0 else "🔴 SL"
+                msg = f"💰 *ПРОДАЖА {symbol}* ({reason})\nЦена: {c_price}\nРезультат: {p_change*100:+.2f}%\nБаланс пары: \${balances[symbol]:.2f}"
+                send_tg_message(msg)
+                positions[symbol] = None
+        time.sleep(0.5)
+
+def run_scheduler():
+    schedule.every(1).minutes.do(check_trade_logic)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+send_tg_message("🚀 *Супер-компактный бот запущен!*\n\nЗапустите массовый бэктест рынка одной командой:\n`/backtest`")
+
+scheduler_thread = threading.Thread(target=run_scheduler)
+scheduler_thread.daemon = True
+scheduler_thread.start()
+
+bot.infinity_polling()
