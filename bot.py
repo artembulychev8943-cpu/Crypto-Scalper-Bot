@@ -1,239 +1,126 @@
-import os
-import sys
-import time
-import threading
-import ccxt
-import pandas as pd
-import schedule
-import telebot
+import os, sys, time, threading, ccxt, schedule, telebot, pandas as pd
 from telebot import types
 
-# === НАСТРОЙКИ TELEGRAM ===
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID_ENV = os.getenv('CHAT_ID')
+# === ИНИЦИАЛИЗАЦИЯ ===
+TELEGRAM_TOKEN, CHAT_ID_ENV = os.getenv('TELEGRAM_TOKEN'), os.getenv('CHAT_ID')
+if not TELEGRAM_TOKEN or not CHAT_ID_ENV: sys.exit(1)
+CHAT_ID, bot = int(CHAT_ID_ENV), telebot.TeleBot(TELEGRAM_TOKEN)
 
-if not TELEGRAM_TOKEN or not CHAT_ID_ENV:
-    print("Ошибка: Переменные окружения не заполнены на хостинге!")
-    sys.exit(1)
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT', 'POL/USDT', 'NEAR/USDT', 'UNI/USDT', 'LTC/USDT', 'APT/USDT', 'ARB/USDT', 'OP/USDT', 'INJ/USDT', 'TIA/USDT', 'SUI/USDT']
+RSI_OVERSOLD, RSI_OVERBOUGHT, MFI_OVERSOLD, MFI_OVERBOUGHT = 30, 70, 20, 80
+TAKE_PROFIT_PCT, STOP_LOSS_PCT = 0.03, 0.015
+active_positions = {s: None for s in SYMBOLS}
 
-CHAT_ID = int(CHAT_ID_ENV)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-def send_tg_message(text, reply_markup=None):
-    try:
-        bot.send_message(CHAT_ID, text, parse_mode='Markdown', reply_markup=reply_markup)
-    except Exception as e:
-        print(f"Ошибка отправки сообщения: {e}")
-
-def handle_exception(exc_type, exc_value, exc_traceback):
-    error_msg = f"❌ *Критический сбой бота на хостинге!*\n\nТип: {exc_type.__name__}\nОшибка: {exc_value}"
-    send_tg_message(error_msg)
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
-
-sys.excepthook = handle_exception
-
-# === НАСТРОЙКИ ТОРГОВОГО БОТА ===
-EXCHANGE_NAME = 'bingx'  
-TIMEFRAME = '5m'         
-CANDLE_LIMIT = 50        
-
-SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
-    'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
-    'POL/USDT', 'NEAR/USDT', 'UNI/USDT', 'LTC/USDT', 'APT/USDT',
-    'ARB/USDT', 'OP/USDT', 'INJ/USDT', 'TIA/USDT', 'SUI/USDT'
-]
-
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
-
-MFI_PERIOD = 14
-MFI_OVERSOLD = 20
-MFI_OVERBOUGHT = 80
-
-TAKE_PROFIT_PCT = 0.03  
-STOP_LOSS_PCT = 0.015   
-
-START_TOTAL_BALANCE = 1000.0
-balance_per_coin = START_TOTAL_BALANCE / len(SYMBOLS)
-
-balances = {symbol: balance_per_coin for symbol in SYMBOLS}
-positions = {symbol: None for symbol in SYMBOLS}
-
-exchange = getattr(ccxt, EXCHANGE_NAME)({
-    'apiKey': os.getenv('BINGX_API_KEY'),
-    'secret': os.getenv('BINGX_SECRET_KEY'),
-    'enableRateLimit': True,  
-    'options': {
-        'defaultType': 'spot'
-    }
+exchange = getattr(ccxt, 'bingx')({
+    'apiKey': os.getenv('BINGX_API_KEY'), 'secret': os.getenv('BINGX_SECRET_KEY'),
+    'enableRateLimit': True, 'options': {'defaultType': 'spot'}
 })
 
-active_positions = {symbol: None for symbol in SYMBOLS}
+def calculate_indicators(df, period=14):
+    deltas = df['close'].diff().dropna()
+    g, l = deltas.clip(lower=0), -deltas.clip(upper=0)
+    rs = g.ewm(com=period-1, adjust=False).mean() / l.ewm(com=period-1, adjust=False).mean()
+    rsi = (100 - (100 / (1 + rs))).iloc[-1]
+    
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    mf = tp * df['volume']
+    dt = tp.diff()
+    pf, nf = pd.Series(0.0, index=tp.index), pd.Series(0.0, index=tp.index)
+    pf[dt > 0], nf[dt < 0] = mf[dt > 0], mf[dt < 0]
+    mfi = (100 - (100 / (1 + (pf.rolling(period).sum() / nf.rolling(period).sum())))).iloc[-1]
+    return rsi, mfi
 
-# --- ЧИСТАЯ МАТЕМАТИКА ---
-def calculate_rsi_series(prices, period=14):
-    deltas = pd.Series(prices).diff().dropna()
-    gain = deltas.clip(lower=0)
-    loss = -deltas.clip(upper=0)
-    avg_gain = gain.ewm(com=period-1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period-1, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_mfi_series(high, low, close, volume, period=14):
-    typical_price = (high + low + close) / 3
-    money_flow = typical_price * volume
-    delta = typical_price.diff()
-    pos_flow = pd.Series(0.0, index=typical_price.index)
-    neg_flow = pd.Series(0.0, index=typical_price.index)
-    pos_flow[delta > 0] = money_flow[delta > 0]
-    neg_flow[delta < 0] = money_flow[delta < 0]
-    pos_mf = pos_flow.rolling(window=period).sum()
-    neg_mf = neg_flow.rolling(window=period).sum()
-    m_ratio = pos_mf / neg_mf
-    return 100 - (100 / (1 + m_ratio))
-
-def get_market_data_single(symbol):
+def get_market_data(symbol, limit=1000):
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=limit)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        rsi_s = calculate_rsi_series(df['close'], period=RSI_PERIOD)
-        mfi_s = calculate_mfi_series(df['high'], df['low'], df['close'], df['volume'], period=MFI_PERIOD)
-        latest = df.iloc[-1].copy()
-        latest['RSI'] = rsi_s.iloc[-1]
-        latest['MFI'] = mfi_s.iloc[-1]
-        return latest
-    except Exception:
-        return None
+        r, m = calculate_indicators(df)
+        return {'close': df['close'].iloc[-1], 'RSI': r, 'MFI': m, 'df': df}
+    except: return None
 
 def get_main_keyboard():
-    """Создание красивой панели кнопок внизу экрана"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_balance = types.KeyboardButton("📊 Баланс портфеля")
-    btn_hot = types.KeyboardButton("🔥 Горячие монеты")
-    btn_backtest = types.KeyboardButton("🔄 Запустить Бэктест")
-    btn_status = types.KeyboardButton("🤖 Статус ИИ")
-    markup.add(btn_balance, btn_hot, btn_backtest, btn_status)
+    markup.add("📊 Баланс портфеля", "🔥 Горячие монеты", "🔄 Запустить Бэктест", "🤖 Статус ИИ")
     return markup
 
-# --- ОБРАБОТКА ТЕКСТОВЫХ КНОПОК ИНТЕРФЕЙСА ---
-@bot.message_handler(func=lambda message: message.chat.id == CHAT_ID)
-def handle_interface_buttons(message):
-    text = message.text
-
-    if text in ["/start", "🤖 Статус ИИ"]:
-        msg = "🤖 *ИИ-Скальпер BingX активен!*\n\nБот работает в фоне, проверяет 20 монет каждую минуту и готов совершать сделки по стратегии RSI + MFI."
-        bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=get_main_keyboard())
-
-    elif text == "📊 Баланс портфеля":
+# --- ТЕЛЕГРАМ ИНТЕРФЕЙС ---
+@bot.message_handler(func=lambda m: m.chat.id == CHAT_ID)
+def handle_buttons(message):
+    t = message.text
+    if t in ["/start", "🤖 Статус ИИ"]:
+        bot.reply_to(message, "🤖 *ИИ-Скальпер BingX активен!*\nКаждую минуту проверяю 20 монет.", parse_mode='Markdown', reply_markup=get_main_keyboard())
+    elif t == "📊 Баланс портфеля":
         try:
-            fetch_bal = exchange.fetch_balance()
-            usdt_free = fetch_bal['free'].get('USDT', 0.0)
-            usdt_total = fetch_bal['total'].get('USDT', 0.0)
-            
-            active_count = sum(1 for sym in SYMBOLS if active_positions[sym] is not None)
-            
-            report = f"📊 *Реальный баланс Спота BingX:*\n💵 Свободно для ИИ: \${usdt_free:.2f} USDT\n💰 Всего на кошельке: \${usdt_total:.2f} USDT\n\n💼 Активных ИИ-сделок: {active_count} из {len(SYMBOLS)}"
-            bot.reply_to(message, report, parse_mode='Markdown')
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка запроса баланса к BingX: {e}")
-
-    elif text == "🔥 Горячие монеты":
-        bot.reply_to(message, "🔍 Сканирую рынок топ-20 на BingX, подождите...")
-        report = f"🔍 *Горячие монеты (RSI < 45):*\n_Чем ближе RSI к 30, тем скорее покупка_\n\n"
-        found_hot = False
-        
-        for symbol in SYMBOLS:
-            data = get_market_data_single(symbol)
-            if data is not None and data['RSI'] < 45:
-                found_hot = True
-                coin_name = symbol.split('/')[0]
-                report += f"🔸 *{coin_name}*: Цена {data['close']} | RSI: {data['RSI']:.1f} | MFI: {data['MFI']:.1f}\n"
+            b = exchange.fetch_balance()
+            uf, ut = b['free'].get('USDT', 0.0), b['total'].get('USDT', 0.0)
+            ac = sum(1 for s in SYMBOLS if active_positions[s] is not None)
+            bot.reply_to(message, f"📊 *Спот BingX:*\n💵 Свободно: \${uf:.2f} USDT\n💰 Всего: \${ut:.2f} USDT\n💼 Сделок: {ac} из 20", parse_mode='Markdown')
+        except Exception as e: bot.reply_to(message, f"❌ Ошибка API: {e}")
+    elif t == "🔥 Горячие монеты":
+        bot.reply_to(message, "🔍 Сканирую топ-20, подождите...")
+        rep, hot = "🔍 *Горячие монеты (RSI < 45):*\n\n", False
+        for s in SYMBOLS:
+            d = get_market_data(s, limit=50)
+            if d and d['RSI'] < 45:
+                hot = True
+                rep += f"🔸 *{s.split('/')[0]}*: {d['close']} | RSI: {d['RSI']:.1f} | MFI: {d['MFI']:.1f}\n"
             time.sleep(0.1)
-            
-        if not found_hot:
-            report += "🟢 Все монеты в стабильной зоне (RSI > 45). Ждем проливов рынка."
-        bot.send_message(CHAT_ID, report, parse_mode='Markdown')
-
-    elif text in ["🔄 Запустить Бэктест", "/backtest"]:
-        bot.reply_to(message, f"⏳ Запущен глобальный бэктест по *{len(SYMBOLS)} монетам* за 3.5 дня. Считаю...", parse_mode='Markdown')
-        summary_report = "📊 *Глобальный бэктест BingX (за 3.5 дня):*\n\n"
-        total_start_funds = len(SYMBOLS) * 1000.0
-        total_final_funds = 0.0
-        global_trades = 0
-        global_wins = 0
-
-        for symbol in SYMBOLS:
+        if not hot: rep += "🟢 Все монеты в стабильной зоне (RSI > 45)."
+        bot.send_message(CHAT_ID, rep, parse_mode='Markdown')
+    elif t == "🔄 Запустить Бэктест":
+        bot.reply_to(message, "⏳ Запущен бэктест топ-20 за 3.5 дня. Считаю...")
+        tf, gt, gw = 0.0, 0, 0
+        for s in SYMBOLS:
             try:
-                bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
-                df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
-                df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
-                df_bt = df_bt.dropna().reset_index(drop=True)
-
-                bt_balance = 1000.0
-                bt_position = None
-
+                d = get_market_data(s, limit=1000)
+                if not d: continue
+                df_bt = d['df'].dropna().reset_index(drop=True)
+                df_bt['RSI'], df_bt['MFI'] = calculate_indicators(df_bt) # Передаем df_bt
+                bb, pos = 1000.0, None
                 for i in range(len(df_bt)):
-                    c_price = df_bt.loc[i, 'close']
-                    rsi_val = df_bt.loc[i, 'RSI']
-                    mfi_val = df_bt.loc[i, 'MFI']
+                    cp, r, m = df_bt.loc[i, 'close'], df_bt.loc[i, 'RSI'], df_bt.loc[i, 'MFI']
+                    if pos is None and r < RSI_OVERSOLD and m < MFI_OVERSOLD:
+                        pos, bb = {'ep': cp, 'a': bb / cp}, 0.0
+                    elif pos is not None:
+                        pc = (cp - pos['ep']) / pos['ep']
+                        if pc >= TAKE_PROFIT_PCT or pc <= -STOP_LOSS_PCT or r > RSI_OVERBOUGHT or m > MFI_OVERBOUGHT:
+                            bb, gt, gw, pos = pos['a'] * cp, gt + 1, gw + (1 if pc > 0 else 0), None
+                tf += bb if pos is None else pos['a'] * df_bt.iloc[-1]['close']
+            except: tf += 1000.0
+            time.sleep(0.1)
+        res = ((tf - 20000.0) / 20000.0) * 100
+        wr = (gw / gt * 100) if gt > 0 else 0
+        bot.send_message(CHAT_ID, f"📈 *Итог бэктеста:*\n💵 Результат: {res:+.2f}%\n🔄 Сделок: {gt}\n🎯 Win Rate: {wr:.1f}%", parse_mode='Markdown')
 
-                    if bt_position is None:
-                        if rsi_val < RSI_OVERSOLD and mfi_val < MFI_OVERSOLD:
-                            bt_position = {'entry_price': c_price, 'amount': bt_balance / c_price}
-                            bt_balance = 0.0
-                    else:
-                        e_price = bt_position['entry_price']
-                        amt = bt_position['amount']
-                        p_change = (c_price - e_price) / e_price
-
-                        if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
-                            bt_balance = amt * c_price
-                            global_trades += 1
-                            if p_change > 0:
-                                global_wins += 1
-                            bt_position = None
-
-                if bt_position is not None:
-                    bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
-                    global_trades += 1
-
-                total_final_funds += bt_balance
-                p_pct = ((bt_balance - 1000.0) / 1000.0) * 100
-                summary_report += f"🔹 {symbol.split('/')[0]}: {p_pct:+.2f}%\n"
-            except Exception:
-                total_final_funds += 1000.0
-                summary_report += f"🔹 {symbol.split('/')[0]}: Ошибка данных ⚠️\n"
-            time.sleep(0.2)
-
-        g_profit_pct = ((total_final_funds - total_start_funds) / total_start_funds) * 100
-        g_win_rate = (global_wins / global_trades * 100) if global_trades > 0 else 0
-
-        summary_report += f"\n📈 *Общий итог стратегии:*\n💵 Результат: {g_profit_pct:+.2f}%\n🔄 Всего сделок: {global_trades}\n🎯 Win Rate: {g_win_rate:.1f}%"
-        bot.send_message(CHAT_ID, summary_report, parse_mode='Markdown')
-
-# --- РАБОТА РОБОТА В РЕАЛЬНОМ ВРЕМЕНИ ---
+# --- ТОРГОВАЯ ЛОГИКА ---
 def check_trade_logic():
-    global balances, positions, active_positions
-    for symbol in SYMBOLS:
+    for s in SYMBOLS:
         try:
-            current_data = get_market_data_single(symbol)
-            if current_data is None:
-                continue
-            c_price = current_data['close']
-            rsi = current_data['RSI']
-            mfi = current_data['MFI']
-
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {symbol} | RSI: {rsi:.1f} | MFI: {mfi:.1f}")
-
-            if active_positions[symbol] is None:
-                if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD:
+            d = get_market_data(s, limit=50)
+            if not d: continue
+            cp, r, m = d['close'], d['RSI'], d['MFI']
+            if active_positions[s] is None:
+                if r < RSI_OVERSOLD and m < MFI_OVERSOLD:
                     bal = exchange.fetch_balance()['free'].get('USDT', 0.0)
-                    amount_usdt = bal * 0.05
-                    if amount_usdt >= 5.0:
-                        order = exchange.create_market_buy_order(symbol, amount_usdt)
-                        
-                        # ЛИНЕЙНЫЙ БЕЗОШИБОЧНЫЙ СИНТАКСИС ЗАПИСИ
+                    amt = bal * 0.05
+                    if amt >= 5.0:
+                        order = exchange.create_market_buy_order(s, amt)
+                        active_positions[s] = {'ep': cp, 'a': order.get('amount', amt / cp)}
+                        bot.send_message(CHAT_ID, f"🛒 *ПОКУПКА BINGX: {s}*\nЦена: {cp}")
+            else:
+                pos = active_positions[s]
+                pc = (cp - pos['ep']) / pos['ep']
+                if pc >= TAKE_PROFIT_PCT or pc <= -STOP_LOSS_PCT or r > RSI_OVERBOUGHT or m > MFI_OVERBOUGHT:
+                    exchange.create_market_sell_order(s, pos['a'])
+                    bot.send_message(CHAT_ID, f"💰 *ПРОДАЖА BINGX: {s}*\nРезультат: {pc*100:+.2f}%")
+                    active_positions[s] = None
+        except: pass
+        time.sleep(0.3)
+
+def run_scheduler():
+    schedule.every(1).minutes.do(check_trade_logic)
+    while True: schedule.run_pending(); time.sleep(1)
+
+bot.send_message(CHAT_ID, f"🚀 *Бот успешно перезапущен!* Код оптимизирован под лимиты сервера.", reply_markup=get_main_keyboard())
+threading.Thread(target=run_scheduler, daemon=True).start()
+bot.infinity_polling()
