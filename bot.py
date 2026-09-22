@@ -38,7 +38,7 @@ EXCHANGE_NAME = 'bybit'
 TIMEFRAME = '5m'         
 CANDLE_LIMIT = 50        
 
-# СПИСОК ИЗ 20 ТОП-МОНЕТ ДЛЯ МОНИТОРИНГА
+# Список из 20 ТОП-монет для мониторинга
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
     'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
@@ -63,24 +63,22 @@ STOP_LOSS_PCT = 0.015
 START_TOTAL_BALANCE = 1000.0
 balance_per_coin = START_TOTAL_BALANCE / len(SYMBOLS)
 
-# Словари балансов и позиций для каждой из 20 монет
 balances = {symbol: balance_per_coin for symbol in SYMBOLS}
 positions = {symbol: None for symbol in SYMBOLS}
 
 exchange = getattr(ccxt, EXCHANGE_NAME)()
 
 # --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ИНДИКАТОРОВ (ЧИСТЫЙ PYTHON) ---
-def calculate_rsi(prices, period=14):
+def calculate_rsi_series(prices, period=14):
     deltas = pd.Series(prices).diff().dropna()
     gain = deltas.clip(lower=0)
     loss = -deltas.clip(upper=0)
     avg_gain = gain.ewm(com=period-1, adjust=False).mean()
     avg_loss = loss.ewm(com=period-1, adjust=False).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1]
+    return 100 - (100 / (1 + rs))
 
-def calculate_mfi(high, low, close, volume, period=14):
+def calculate_mfi_series(high, low, close, volume, period=14):
     typical_price = (high + low + close) / 3
     money_flow = typical_price * volume
     delta = typical_price.diff()
@@ -91,8 +89,7 @@ def calculate_mfi(high, low, close, volume, period=14):
     pos_mf = pos_flow.rolling(window=period).sum()
     neg_mf = neg_flow.rolling(window=period).sum()
     m_ratio = pos_mf / neg_mf
-    mfi = 100 - (100 / (1 + m_ratio))
-    return mfi.iloc[-1]
+    return 100 - (100 / (1 + m_ratio))
 
 # --- ОБРАБОТКА КОМАНД В ТЕЛЕГРАМ ---
 @bot.message_handler(commands=['start', 'balance'])
@@ -109,7 +106,7 @@ def send_balance(message):
                 total_value += balances[symbol]
             else:
                 active_trades += 1
-                current_data = get_market_data(symbol)
+                current_data = get_market_data_single(symbol)
                 if current_data is not None:
                     current_price = current_data['close']
                     entry_price = pos['entry_price']
@@ -118,37 +115,102 @@ def send_balance(message):
                     total_value += current_cost
                     report += f"🔸 *{symbol}:* В сделке! Профит: {profit_pct:+.2f}% (\${current_cost:.2f})\n"
                 else:
-                    current_cost = pos['amount'] * pos['entry_price']
-                    total_value += current_cost
+                    total_value += (pos['amount'] * pos['entry_price'])
                     report += f"🔸 *{symbol}:* В сделке (связь ограничена)\n"
                     
         report += f"\n💼 Активных сделок: {active_trades} из {len(SYMBOLS)}"
         report += f"\n💰 *Общая стоимость активов:* \${total_value:.2f}"
         bot.reply_to(message, report, parse_mode='Markdown')
 
-def get_market_data(symbol):
-    """Скачивание свечей для конкретной монеты"""
+@bot.message_handler(commands=['backtest'])
+def run_tg_backtest(message):
+    """Запуск бэктеста по запросу из Telegram. Пример: /backtest SOL или /backtest BTC"""
+    if message.chat.id != CHAT_ID:
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Укажите монету. Пример:\n`/backtest SOL` или `/backtest BTC/USDT`", parse_mode='Markdown')
+        return
+
+    raw_symbol = args[1].upper()
+    symbol = raw_symbol if '/' in raw_symbol else f"{raw_symbol}/USDT"
+
+    bot.reply_to(message, f"⏳ Запущен бэктест для *{symbol}* на истории в 1000 свечей (3.5 дня). Подождите несколько секунд...", parse_mode='Markdown')
+
+    try:
+        # Скачиваем глубокую историю с биржи
+        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
+        df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
+        df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
+        df_bt = df_bt.dropna().reset_index(drop=True)
+
+        bt_balance = 1000.0
+        bt_position = None
+        total_trades = 0
+        win_trades = 0
+
+        for i in range(len(df_bt)):
+            c_price = df_bt.loc[i, 'close']
+            rsi_val = df_bt.loc[i, 'RSI']
+            mfi_val = df_bt.loc[i, 'MFI']
+
+            if bt_position is None:
+                if rsi_val < RSI_OVERSOLD and mfi_val < MFI_OVERSOLD:
+                    bt_position = {'entry_price': c_price, 'amount': bt_balance / c_price}
+                    bt_balance = 0.0
+            else:
+                e_price = bt_position['entry_price']
+                amt = bt_position['amount']
+                p_change = (c_price - e_price) / e_price
+
+                if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
+                    bt_balance = amt * c_price
+                    total_trades += 1
+                    if p_change > 0:
+                        win_trades += 1
+                    bt_position = None
+
+        if bt_position is not None:
+            bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
+
+        profit_pct = ((bt_balance - 1000.0) / 1000.0) * 100
+        win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0
+
+        report = (f"📊 *Результаты бэктеста для {symbol}:*\n\n"
+                  f"💰 Стартовый баланс: \$1000.00\n"
+                  f"💵 Финальный баланс: \${bt_balance:.2f}\n"
+                  f"📈 Чистая прибыль: {profit_pct:+.2f}%\n"
+                  f"🔄 Всего сделок: {total_trades}\n"
+                  f"🟢 Прибыльных: {win_trades}\n"
+                  f"🎯 Win Rate: {win_rate:.1f}%")
+        bot.reply_to(message, report, parse_mode='Markdown')
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ Не удалось провести бэктест для {symbol}. Проверьте правильность тикера.\nОшибка: {e}")
+
+def get_market_data_single(symbol):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        rsi_val = calculate_rsi(df['close'], period=RSI_PERIOD)
-        mfi_val = calculate_mfi(df['high'], df['low'], df['close'], df['volume'], period=MFI_PERIOD)
+        rsi_series = calculate_rsi_series(df['close'], period=RSI_PERIOD)
+        mfi_series = calculate_mfi_series(df['high'], df['low'], df['close'], df['volume'], period=MFI_PERIOD)
         
         latest = df.iloc[-1].copy()
-        latest['RSI'] = rsi_val
-        latest['MFI'] = mfi_val
+        latest['RSI'] = rsi_series.iloc[-1]
+        latest['MFI'] = mfi_series.iloc[-1]
         return latest
     except Exception as e:
-        print(f"Ошибка получения данных для {symbol}: {e}")
         return None
 
 def check_trade_logic():
-    """Последовательный обход всех 20 монет в цикле"""
     global balances, positions
     
     for symbol in SYMBOLS:
-        current_data = get_market_data(symbol)
+        current_data = get_market_data_single(symbol)
         if current_data is None:
             continue
             
@@ -156,18 +218,13 @@ def check_trade_logic():
         rsi = current_data['RSI']
         mfi = current_data['MFI']
         
-        # Печатаем логи в консоль хостинга (для контроля)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {symbol} | Цена: {current_price} | RSI: {rsi:.2f} | MFI: {mfi:.2f}")
 
-        # Сценарий 1: Ищем точку входа
         if positions[symbol] is None:
             if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD:
                 if balances[symbol] > 0:
                     amount_to_buy = balances[symbol] / current_price
-                    positions[symbol] = {
-                        'entry_price': current_price,
-                        'amount': amount_to_buy
-                    }
+                    positions[symbol] = {'entry_price': current_price, 'amount': amount_to_buy}
                     balances[symbol] = 0.0
                     
                     msg = (f"🛒 *СИГНАЛ НА ПОКУПКУ*\n\n"
@@ -176,7 +233,6 @@ def check_trade_logic():
                            f"📊 *Индикаторы:* RSI {rsi:.1f}, MFI {mfi:.1f}")
                     send_tg_message(msg)
                 
-        # Сценарий 2: Проверяем выход из сделки
         else:
             pos = positions[symbol]
             entry_price = pos['entry_price']
@@ -189,42 +245,8 @@ def check_trade_logic():
             
             if is_take_profit or is_stop_loss or is_overbought:
                 balances[symbol] = amount * current_price
-                
-                if is_take_profit:
-                    reason = "🟢 Take-Profit"
-                elif is_stop_loss:
-                    reason = "🔴 Stop-Loss"
-                else:
-                    reason = "🟡 Перекупленность рынка"
+                reason = "🟢 Take-Profit" if is_take_profit else ("🔴 Stop-Loss" if is_stop_loss else "🟡 Перекупленность")
                 
                 msg = (f"💰 *СИГНАЛ НА ПРОДАЖУ*\n\n"
                        f"🔹 *Монета:* {symbol}\n"
                        f"🔹 *Причина:* {reason}\n"
-                       f"🔹 *Цена выхода:* {current_price}\n"
-                       f"📈 *Результат:* {price_change*100:+.2f}%\n"
-                       f"💵 *Баланс пары:* \${balances[symbol]:.2f}")
-                send_tg_message(msg)
-                positions[symbol] = None
-        
-        # Небольшая пауза между запросами к API биржи, чтобы Bybit не заблокировал за спам
-        time.sleep(0.5)
-
-def run_scheduler():
-    schedule.every(1).minutes.do(check_trade_logic)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-# Приветственное сообщение
-send_tg_message(f"🚀 *Мультивалютный ИИ-скальпер запущен!*\nВ мониторинг добавлено 20 ТОП-монет.\nНа каждую выделен демо-лимит: \${balance_per_coin:.2f}")
-
-# Запуск потоков
-scheduler_thread = threading.Thread(target=run_scheduler)
-scheduler_thread.daemon = True
-scheduler_thread.start()
-
-try:
-    bot.infinity_polling()
-except Exception as e:
-    print(f"Ошибка пуллинга Telegram: {e}")
-    time.sleep(5)
