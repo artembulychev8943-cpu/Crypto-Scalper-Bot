@@ -118,8 +118,8 @@ def send_balance(message):
                     total_value += (pos['amount'] * pos['entry_price'])
                     report += f"🔸 *{symbol}:* В сделке (связь ограничена)\n"
                     
-        report += f"\n💼 Активных сделок: {active_trades} из {len(SYMBOLS)}"
-        report += f"\n💰 *Общая стоимость активов:* \${total_value:.2f}"
+        report += f"\n💼 Активных сделок: {active_trades} из {len(SYMBOLS)}\n"
+        report += f"💰 *Общая стоимость активов:* \${total_value:.2f}"
         bot.reply_to(message, report, parse_mode='Markdown')
 
 @bot.message_handler(commands=['backtest'])
@@ -130,9 +130,9 @@ def run_tg_backtest(message):
 
     args = message.text.split()
     
-    # Если аргументов нет или введено 'all', запускаем массовый тест
+    # Массовый бэктест по всему списку
     if len(args) < 2 or args[1].lower() == 'all':
-        bot.reply_to(message, f"⏳ Запущен массовый бэктест по всем *{len(SYMBOLS)} монетам* за 3.5 дня. Это займет около 15 секунд...", parse_mode='Markdown')
+        bot.reply_to(message, f"⏳ Запущен массовый бэктест по всем *{len(SYMBOLS)} монетам* за 3.5 дня. Подождите около 15 секунд...", parse_mode='Markdown')
         
         summary_report = "📊 *Глобальный бэктест (Топ-20 за 3.5 дня):*\n\n"
         total_start_funds = len(SYMBOLS) * 1000.0
@@ -196,7 +196,7 @@ def run_tg_backtest(message):
         bot.send_message(CHAT_ID, summary_report, parse_mode='Markdown')
         return
 
-    # Одиночный бэктест, если указана конкретная монета
+    # Одиночный бэктест конкретной монеты
     raw_symbol = args[1].upper()
     symbol = raw_symbol if '/' in raw_symbol else f"{raw_symbol}/USDT"
     bot.reply_to(message, f"⏳ Запущен бэктест для *{symbol}*...", parse_mode='Markdown')
@@ -240,6 +240,4 @@ def run_tg_backtest(message):
         profit_pct = ((bt_balance - 1000.0) / 1000.0) * 100
         win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0
 
-        report = (f"📊 *Результаты бэктеста для {symbol}:*\n\n"
-                  f"💰 Стартовый баланс: \$1000.00\n"
-                  f"💵 Финальный баланс: \${bt_balance:.2f}\n"
+        report = f"📊 *Результаты бэктеста для {symbol}:*\n\n💰 Стартовый баланс: \$1000.00\n💵 Финальный баланс: \${bt_balance:.2f}\n📈 Чистая прибыль: {profit_pct:+.2f}%\n🔄 Всего сделок: {total_trades}\n🎯 Win Rate: {win_rate:.1f}%"
