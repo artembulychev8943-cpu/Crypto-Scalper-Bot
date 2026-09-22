@@ -29,10 +29,11 @@ EXCHANGE_NAME = 'bybit'
 TIMEFRAME = '5m'         
 CANDLE_LIMIT = 50        
 
+# Список из 20 ТОП-монет (MATIC заменен на актуальный POL)
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
     'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
-    'MATIC/USDT', 'NEAR/USDT', 'UNI/USDT', 'LTC/USDT', 'APT/USDT',
+    'POL/USDT', 'NEAR/USDT', 'UNI/USDT', 'LTC/USDT', 'APT/USDT',
     'ARB/USDT', 'OP/USDT', 'INJ/USDT', 'TIA/USDT', 'SUI/USDT'
 ]
 
@@ -126,43 +127,49 @@ def run_tg_backtest(message):
     global_wins = 0
 
     for symbol in SYMBOLS:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
-        df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
-        df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
-        df_bt = df_bt.dropna().reset_index(drop=True)
+        try:
+            bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
+            df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
+            df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
+            df_bt = df_bt.dropna().reset_index(drop=True)
 
-        bt_balance = 1000.0
-        bt_position = None
+            bt_balance = 1000.0
+            bt_position = None
 
-        for i in range(len(df_bt)):
-            c_price = df_bt.loc[i, 'close']
-            rsi_val = df_bt.loc[i, 'RSI']
-            mfi_val = df_bt.loc[i, 'MFI']
+            for i in range(len(df_bt)):
+                c_price = df_bt.loc[i, 'close']
+                rsi_val = df_bt.loc[i, 'RSI']
+                mfi_val = df_bt.loc[i, 'MFI']
 
-            if bt_position is None:
-                if rsi_val < RSI_OVERSOLD and mfi_val < MFI_OVERSOLD:
-                    bt_position = {'entry_price': c_price, 'amount': bt_balance / c_price}
-                    bt_balance = 0.0
-            else:
-                e_price = bt_position['entry_price']
-                amt = bt_position['amount']
-                p_change = (c_price - e_price) / e_price
+                if bt_position is None:
+                    if rsi_val < RSI_OVERSOLD and mfi_val < MFI_OVERSOLD:
+                        bt_position = {'entry_price': c_price, 'amount': bt_balance / c_price}
+                        bt_balance = 0.0
+                else:
+                    e_price = bt_position['entry_price']
+                    amt = bt_position['amount']
+                    p_change = (c_price - e_price) / e_price
 
-                if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
-                    bt_balance = amt * c_price
-                    global_trades += 1
-                    if p_change > 0:
-                        global_wins += 1
-                    bt_position = None
+                    if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
+                        bt_balance = amt * c_price
+                        global_trades += 1
+                        if p_change > 0:
+                            global_wins += 1
+                        bt_position = None
 
-        if bt_position is not None:
-            bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
-            global_trades += 1
+            if bt_position is not None:
+                bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
+                global_trades += 1
 
-        total_final_funds += bt_balance
-        p_pct = ((bt_balance - 1000.0) / 1000.0) * 100
-        summary_report += f"🔹 {symbol}: {p_pct:+.2f}%\n"
+            total_final_funds += bt_balance
+            p_pct = ((bt_balance - 1000.0) / 1000.0) * 100
+            summary_report += f"🔹 {symbol}: {p_pct:+.2f}%\n"
+        except Exception as e:
+            total_final_funds += 1000.0
+            summary_report += f"🔹 {symbol}: Ошибка данных (Пропущено) ⚠️\n"
+            print(f"Ошибка бэктеста для {symbol}: {e}")
+            
         time.sleep(0.3)
 
     g_profit_pct = ((total_final_funds - total_start_funds) / total_start_funds) * 100
@@ -175,29 +182,32 @@ def run_tg_backtest(message):
 def check_trade_logic():
     global balances, positions
     for symbol in SYMBOLS:
-        current_data = get_market_data_single(symbol)
-        if current_data is None:
-            continue
-        c_price = current_data['close']
-        rsi = current_data['RSI']
-        mfi = current_data['MFI']
+        try:
+            current_data = get_market_data_single(symbol)
+            if current_data is None:
+                continue
+            c_price = current_data['close']
+            rsi = current_data['RSI']
+            mfi = current_data['MFI']
 
-        if positions[symbol] is None:
-            if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD and balances[symbol] > 0:
-                positions[symbol] = {'entry_price': c_price, 'amount': balances[symbol] / c_price}
-                balances[symbol] = 0.0
-                msg = f"🛒 *ПОКУПКА {symbol}*\nЦена: {c_price}\nRSI: {rsi:.1f}, MFI: {mfi:.1f}"
-                send_tg_message(msg)
-        else:
-            pos = positions[symbol]
-            p_change = (c_price - pos['entry_price']) / pos['entry_price']
-            
-            if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT:
-                balances[symbol] = pos['amount'] * c_price
-                reason = "🟢 TP" if p_change > 0 else "🔴 SL"
-                msg = f"💰 *ПРОДАЖА {symbol}* ({reason})\nЦена: {c_price}\nРезультат: {p_change*100:+.2f}%\nБаланс пары: \${balances[symbol]:.2f}"
-                send_tg_message(msg)
-                positions[symbol] = None
+            if positions[symbol] is None:
+                if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD and balances[symbol] > 0:
+                    positions[symbol] = {'entry_price': c_price, 'amount': balances[symbol] / c_price}
+                    balances[symbol] = 0.0
+                    msg = f"🛒 *ПОКУПКА {symbol}*\nЦена: {c_price}\nRSI: {rsi:.1f}, MFI: {mfi:.1f}"
+                    send_tg_message(msg)
+            else:
+                pos = positions[symbol]
+                p_change = (c_price - pos['entry_price']) / pos['entry_price']
+                
+                if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT:
+                    balances[symbol] = pos['amount'] * c_price
+                    reason = "🟢 TP" if p_change > 0 else "🔴 SL"
+                    msg = f"💰 *ПРОДАЖА {symbol}* ({reason})\nЦена: {c_price}\nРезультат: {p_change*100:+.2f}%\nБаланс пары: \${balances[symbol]:.2f}"
+                    send_tg_message(msg)
+                    positions[symbol] = None
+        except Exception as e:
+            print(f"Ошибка логики торговли для {symbol}: {e}")
         time.sleep(0.5)
 
 def run_scheduler():
@@ -206,7 +216,7 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-send_tg_message("🚀 *Супер-компактный бот запущен!*\n\nЗапустите массовый бэктест рынка одной командой:\n`/backtest`")
+send_tg_message("🚀 *Бот успешно обновлен!*\nУстаревший тикер MATIC заменен на актуальный POL. Защита от ошибок API добавлена.\n\nЗапустите массовый бэктест рынка заново:\n`/backtest`")
 
 scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.daemon = True
