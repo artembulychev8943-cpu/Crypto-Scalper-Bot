@@ -183,7 +183,6 @@ def run_tg_backtest(message):
                 total_final_funds += 1000.0
                 summary_report += f"🔹 *{symbol}:* Ошибка данных ❌\n"
             
-            # Пауза во избежание DDOS-блокировок от биржи
             time.sleep(0.3)
 
         global_profit_pct = ((total_final_funds - total_start_funds) / total_start_funds) * 100
@@ -243,3 +242,4 @@ def run_tg_backtest(message):
 
         report = (f"📊 *Результаты бэктеста для {symbol}:*\n\n"
                   f"💰 Стартовый баланс: \$1000.00\n"
+                  f"💵 Финальный баланс: \${bt_balance:.2f}\n"
