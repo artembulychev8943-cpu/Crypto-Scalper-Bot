@@ -68,7 +68,7 @@ positions = {symbol: None for symbol in SYMBOLS}
 
 exchange = getattr(ccxt, EXCHANGE_NAME)()
 
-# --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ИНДИКАТОРОВ (ЧИСТЫЙ PYTHON) ---
+# --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ИНДИKАТОРОВ (ЧИСТЫЙ PYTHON) ---
 def calculate_rsi_series(prices, period=14):
     deltas = pd.Series(prices).diff().dropna()
     gain = deltas.clip(lower=0)
