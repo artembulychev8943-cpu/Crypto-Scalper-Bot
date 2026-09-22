@@ -25,6 +25,13 @@ def send_tg_message(text, reply_markup=None):
     except Exception as e:
         print(f"Ошибка отправки сообщения: {e}")
 
+def handle_exception(exc_type, exc_value, exc_traceback):
+    error_msg = f"❌ *Критический сбой бота на хостинге!*\n\nТип: {exc_type.__name__}\nОшибка: {exc_value}"
+    send_tg_message(error_msg)
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = handle_exception
+
 # === НАСТРОЙКИ ТОРГОВОГО БОТА ===
 EXCHANGE_NAME = 'bingx'  
 TIMEFRAME = '5m'         
@@ -102,7 +109,7 @@ def get_market_data_single(symbol):
         return None
 
 def get_main_keyboard():
-    """Создание красивой панели кнопок"""
+    """Создание красивой панели кнопок внизу экрана"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     btn_balance = types.KeyboardButton("📊 Баланс портфеля")
     btn_hot = types.KeyboardButton("🔥 Горячие монеты")
@@ -232,8 +239,3 @@ def check_trade_logic():
                     if amount_usdt >= 5.0:
                         order = exchange.create_market_buy_order(symbol, amount_usdt)
                         active_positions[symbol] = {
-                            'entry_price': c_price,
-                            'amount': order['amount'] if 'amount' in order else (amount_usdt / c_price)
-                        }
-                        send_tg_message(f"🛒 *ПОКУПКА BINGX: {symbol}*\nЦена: {c_price}")
-            else:
