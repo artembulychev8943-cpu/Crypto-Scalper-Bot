@@ -1,9 +1,9 @@
 import os
+import sys
 import time
 import threading
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import schedule
 import telebot
 
@@ -12,10 +12,26 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID_ENV = os.getenv('CHAT_ID')
 
 if not TELEGRAM_TOKEN or not CHAT_ID_ENV:
-    raise ValueError("Критическая ошибка: Переменные окружения TELEGRAM_TOKEN или CHAT_ID не заполнены на хостинге!")
+    print("Ошибка: Переменные окружения не заполнены на хостинге!")
+    sys.exit(1)
 
 CHAT_ID = int(CHAT_ID_ENV)
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+def send_tg_message(text):
+    """Отправка сообщений в Telegram"""
+    try:
+        bot.send_message(CHAT_ID, text, parse_mode='Markdown')
+    except Exception as e:
+        print(f"Ошибка отправки сообщения в Telegram: {e}")
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Перехват критических ошибок и отправка их владельцу"""
+    error_msg = f"❌ *Критический сбой бота на хостинге!*\n\nТип: {exc_type.__name__}\nОшибка: {exc_value}"
+    send_tg_message(error_msg)
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = handle_exception
 
 # === НАСТРОЙКИ ТОРГОВОГО БОТА ===
 EXCHANGE_NAME = 'bybit'  
@@ -40,18 +56,43 @@ position = None
 
 exchange = getattr(ccxt, EXCHANGE_NAME)()
 
-def send_tg_message(text):
-    """Отправка сообщений в Telegram"""
-    try:
-        bot.send_message(CHAT_ID, text, parse_mode='Markdown')
-    except Exception as e:
-        print(f"Ошибка отправки сообщения в Telegram: {e}")
+# --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ИНДИКАТОРОВ (ЧИСТЫЙ PYTHON) ---
+def calculate_rsi(prices, period=14):
+    """Расчет индикатора RSI"""
+    deltas = pd.Series(prices).diff().dropna()
+    gain = deltas.clip(lower=0)
+    loss = -deltas.clip(upper=0)
+    
+    avg_gain = gain.ewm(com=period-1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period-1, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
+
+def calculate_mfi(high, low, close, volume, period=14):
+    """Расчет индикатора MFI (Money Flow Index)"""
+    typical_price = (high + low + close) / 3
+    money_flow = typical_price * volume
+    
+    delta = typical_price.diff()
+    pos_flow = pd.Series(0.0, index=typical_price.index)
+    neg_flow = pd.Series(0.0, index=typical_price.index)
+    
+    pos_flow[delta > 0] = money_flow[delta > 0]
+    neg_flow[delta < 0] = money_flow[delta < 0]
+    
+    pos_mf = pos_flow.rolling(window=period).sum()
+    neg_mf = neg_flow.rolling(window=period).sum()
+    
+    m_ratio = pos_mf / neg_mf
+    mfi = 100 - (100 / (1 + m_ratio))
+    return mfi.iloc[-1]
 
 # --- ОБРАБОТКА КОМАНД В ТЕЛЕГРАМ ---
 @bot.message_handler(commands=['start', 'balance'])
 def send_balance(message):
     """Ответ на команду /balance или /start"""
-    # Проверяем, что пишет именно владелец бота
     if message.chat.id == CHAT_ID:
         if position is None:
             status_text = f"💰 *Ваш баланс:* \${balance:.2f}\nВ данный момент открытых сделок нет."
@@ -67,20 +108,23 @@ def send_balance(message):
                                f"📈 Текущий профит: {profit_pct:+.2f}%\n"
                                f"💰 Баланс в монетах: {position['amount']:.3f} SOL")
             else:
-                status_text = "Сделка открыта, но не удалось получить текущую цену с биржи."
+                status_text = "Сделка открыта, но не удалось получить цену с биржи."
         
         bot.reply_to(message, status_text, parse_mode='Markdown')
 
 def get_market_data():
-    """Скачивание свечей и расчет индикаторов"""
+    """Скачивание свечей и запуск функций расчета"""
     try:
         bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        df['RSI'] = ta.rsi(df['close'], length=RSI_PERIOD)
-        df['MFI'] = ta.mfi(df['high'], df['low'], df['close'], df['volume'], length=MFI_PERIOD)
+        rsi_val = calculate_rsi(df['close'], period=RSI_PERIOD)
+        mfi_val = calculate_mfi(df['high'], df['low'], df['close'], df['volume'], period=MFI_PERIOD)
         
-        return df.iloc[-1]  
+        latest = df.iloc[-1].copy()
+        latest['RSI'] = rsi_val
+        latest['MFI'] = mfi_val
+        return latest
     except Exception as e:
         print(f"Ошибка получения рыночных данных: {e}")
         return None
@@ -151,15 +195,15 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# Приветственное сообщение
-send_tg_message("🤖 *Крипто-бот успешно запущен на хостинге!*\nТорговая стратегия RSI + MFI активирована в демо-режиме.\n\nВы можете отправить команду `/balance` для проверки счета.")
+# Приветственное сообщение владельцу
+send_tg_message("🤖 *Крипто-бот успешно запущен на хостинге!*\nСтратегия RSI + MFI (Pure Math) активирована в демо-режиме.\n\nИспользуйте команду `/balance` для проверки.")
 
-# Запуск торговой логики в фоновом режиме
+# Запуск торговой логики
 scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.daemon = True
 scheduler_thread.start()
 
-# Запуск прослушивания сообщений Telegram (чтобы бот отвечал на команды)
+# Запуск прослушивания сообщений Telegram
 try:
     bot.infinity_polling()
 except Exception as e:
