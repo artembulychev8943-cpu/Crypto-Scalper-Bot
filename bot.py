@@ -38,7 +38,7 @@ EXCHANGE_NAME = 'bybit'
 TIMEFRAME = '5m'         
 CANDLE_LIMIT = 50        
 
-# Список из 20 ТОП-монет для мониторинга
+# Список из 20 ТОП-монет для мониторинга и массового бэктеста
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
     'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
@@ -124,25 +124,87 @@ def send_balance(message):
 
 @bot.message_handler(commands=['backtest'])
 def run_tg_backtest(message):
-    """Запуск бэктеста по запросу из Telegram. Пример: /backtest SOL или /backtest BTC"""
+    """Запуск бэктеста. /backtest [монета] или просто /backtest для всех 20 монет"""
     if message.chat.id != CHAT_ID:
         return
 
     args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ Укажите монету. Пример:\n`/backtest SOL` или `/backtest BTC/USDT`", parse_mode='Markdown')
+    
+    # Если аргументов нет или введено 'all', запускаем массовый тест
+    if len(args) < 2 or args[1].lower() == 'all':
+        bot.reply_to(message, f"⏳ Запущен массовый бэктест по всем *{len(SYMBOLS)} монетам* за 3.5 дня. Это займет около 15 секунд...", parse_mode='Markdown')
+        
+        summary_report = "📊 *Глобальный бэктест (Топ-20 за 3.5 дня):*\n\n"
+        total_start_funds = len(SYMBOLS) * 1000.0
+        total_final_funds = 0.0
+        global_trades = 0
+        global_wins = 0
+
+        for symbol in SYMBOLS:
+            try:
+                bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
+                df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
+                df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
+                df_bt = df_bt.dropna().reset_index(drop=True)
+
+                bt_balance = 1000.0
+                bt_position = None
+
+                for i in range(len(df_bt)):
+                    c_price = df_bt.loc[i, 'close']
+                    rsi_val = df_bt.loc[i, 'RSI']
+                    mfi_val = df_bt.loc[i, 'MFI']
+
+                    if bt_position is None:
+                        if rsi_val < RSI_OVERSOLD and mfi_val < MFI_OVERSOLD:
+                            bt_position = {'entry_price': c_price, 'amount': bt_balance / c_price}
+                            bt_balance = 0.0
+                    else:
+                        e_price = bt_position['entry_price']
+                        amt = bt_position['amount']
+                        p_change = (c_price - e_price) / e_price
+
+                        if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi_val > RSI_OVERBOUGHT or mfi_val > MFI_OVERBOUGHT:
+                            bt_balance = amt * c_price
+                            global_trades += 1
+                            if p_change > 0:
+                                global_wins += 1
+                            bt_position = None
+
+                if bt_position is not None:
+                    bt_balance = bt_position['amount'] * df_bt.iloc[-1]['close']
+
+                total_final_funds += bt_balance
+                profit_pct = ((bt_balance - 1000.0) / 1000.0) * 100
+                summary_report += f"🔹 *{symbol}:* {profit_pct:+.2f}%\n"
+
+            except Exception:
+                total_final_funds += 1000.0
+                summary_report += f"🔹 *{symbol}:* Ошибка данных ❌\n"
+            
+            # Пауза во избежание DDOS-блокировок от биржи
+            time.sleep(0.3)
+
+        global_profit_pct = ((total_final_funds - total_start_funds) / total_start_funds) * 100
+        global_win_rate = (global_wins / global_trades * 100) if global_trades > 0 else 0
+
+        summary_report += f"\n📈 *Общий итог стратегии:*\n"
+        summary_report += f"💵 Финальный результат: {global_profit_pct:+.2f}%\n"
+        summary_report += f"🔄 Всего сделок по рынку: {global_trades}\n"
+        summary_report += f"🎯 Средний Win Rate: {global_win_rate:.1f}%"
+        
+        bot.send_message(CHAT_ID, summary_report, parse_mode='Markdown')
         return
 
+    # Одиночный бэктест, если указана конкретная монета
     raw_symbol = args[1].upper()
     symbol = raw_symbol if '/' in raw_symbol else f"{raw_symbol}/USDT"
-
-    bot.reply_to(message, f"⏳ Запущен бэктест для *{symbol}* на истории в 1000 свечей (3.5 дня). Подождите несколько секунд...", parse_mode='Markdown')
+    bot.reply_to(message, f"⏳ Запущен бэктест для *{symbol}*...", parse_mode='Markdown')
 
     try:
-        # Скачиваем глубокую историю с биржи
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=1000)
         df_bt = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
         df_bt['RSI'] = calculate_rsi_series(df_bt['close'], period=RSI_PERIOD)
         df_bt['MFI'] = calculate_mfi_series(df_bt['high'], df_bt['low'], df_bt['close'], df_bt['volume'], period=MFI_PERIOD)
         df_bt = df_bt.dropna().reset_index(drop=True)
@@ -181,72 +243,3 @@ def run_tg_backtest(message):
 
         report = (f"📊 *Результаты бэктеста для {symbol}:*\n\n"
                   f"💰 Стартовый баланс: \$1000.00\n"
-                  f"💵 Финальный баланс: \${bt_balance:.2f}\n"
-                  f"📈 Чистая прибыль: {profit_pct:+.2f}%\n"
-                  f"🔄 Всего сделок: {total_trades}\n"
-                  f"🟢 Прибыльных: {win_trades}\n"
-                  f"🎯 Win Rate: {win_rate:.1f}%")
-        bot.reply_to(message, report, parse_mode='Markdown')
-
-    except Exception as e:
-        bot.reply_to(message, f"❌ Не удалось провести бэктест для {symbol}. Проверьте правильность тикера.\nОшибка: {e}")
-
-def get_market_data_single(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        rsi_series = calculate_rsi_series(df['close'], period=RSI_PERIOD)
-        mfi_series = calculate_mfi_series(df['high'], df['low'], df['close'], df['volume'], period=MFI_PERIOD)
-        
-        latest = df.iloc[-1].copy()
-        latest['RSI'] = rsi_series.iloc[-1]
-        latest['MFI'] = mfi_series.iloc[-1]
-        return latest
-    except Exception as e:
-        return None
-
-def check_trade_logic():
-    global balances, positions
-    
-    for symbol in SYMBOLS:
-        current_data = get_market_data_single(symbol)
-        if current_data is None:
-            continue
-            
-        current_price = current_data['close']
-        rsi = current_data['RSI']
-        mfi = current_data['MFI']
-        
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {symbol} | Цена: {current_price} | RSI: {rsi:.2f} | MFI: {mfi:.2f}")
-
-        if positions[symbol] is None:
-            if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD:
-                if balances[symbol] > 0:
-                    amount_to_buy = balances[symbol] / current_price
-                    positions[symbol] = {'entry_price': current_price, 'amount': amount_to_buy}
-                    balances[symbol] = 0.0
-                    
-                    msg = (f"🛒 *СИГНАЛ НА ПОКУПКУ*\n\n"
-                           f"🔹 *Инструмент:* {symbol}\n"
-                           f"🔹 *Цена входа:* {current_price}\n"
-                           f"📊 *Индикаторы:* RSI {rsi:.1f}, MFI {mfi:.1f}")
-                    send_tg_message(msg)
-                
-        else:
-            pos = positions[symbol]
-            entry_price = pos['entry_price']
-            amount = pos['amount']
-            price_change = (current_price - entry_price) / entry_price
-            
-            is_take_profit = price_change >= TAKE_PROFIT_PCT
-            is_stop_loss = price_change <= -STOP_LOSS_PCT
-            is_overbought = rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT
-            
-            if is_take_profit or is_stop_loss or is_overbought:
-                balances[symbol] = amount * current_price
-                reason = "🟢 Take-Profit" if is_take_profit else ("🔴 Stop-Loss" if is_stop_loss else "🟡 Перекупленность")
-                
-                msg = (f"💰 *СИГНАЛ НА ПРОДАЖУ*\n\n"
-                       f"🔹 *Монета:* {symbol}\n"
-                       f"🔹 *Причина:* {reason}\n"
