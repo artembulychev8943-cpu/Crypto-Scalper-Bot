@@ -30,8 +30,6 @@ BINGX_SEC = os.getenv('BINGX_SECRET_KEY')
 
 if not BINGX_KEY or not BINGX_SEC:
     print("ВНИМАНИЕ: Переменные BINGX_API_KEY или BINGX_SECRET_KEY отсутствуют!")
-    print("Бот запущен в режиме ожидания настройки ключей.")
-    # Не даем боту упасть, просто держим его запущенным для логов
     while True:
         time.sleep(10)
 
@@ -64,7 +62,7 @@ balance_per_coin = START_TOTAL_BALANCE / len(SYMBOLS)
 balances = {symbol: balance_per_coin for symbol in SYMBOLS}
 positions = {symbol: None for symbol in SYMBOLS}
 
-# Инициализируем биржу боевыми ключами
+# Инициализируем биржу
 exchange = getattr(ccxt, EXCHANGE_NAME)({
     'apiKey': BINGX_KEY,
     'secret': BINGX_SEC,
@@ -128,6 +126,25 @@ def send_balance(message):
         bot.reply_to(message, report, parse_mode='Markdown')
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка запроса баланса к BingX: {e}")
+
+@bot.message_handler(commands=['status'])
+def send_status(message):
+    """Живая проверка анализа рынка по главным монетам"""
+    if message.chat.id != CHAT_ID:
+        return
+    bot.reply_to(message, "🔍 Запрашиваю текущие показатели индикаторов с BingX...")
+    
+    test_coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+    report = "📈 *Текущий ИИ-анализ рынка:*\n\n"
+    
+    for symbol in test_coins:
+        data = get_market_data_single(symbol)
+        if data is not None:
+            report += f"🔹 *{symbol}*:\nЦена: {data['close']}\n📊 RSI: {data['RSI']:.2f} (надо < 30)\n📊 MFI: {data['MFI']:.2f} (надо < 20)\n\n"
+        else:
+            report += f"🔹 *{symbol}*: Ошибка запроса данных ⚠️\n\n"
+            
+    bot.send_message(CHAT_ID, report, parse_mode='Markdown')
 
 @bot.message_handler(commands=['backtest'])
 def run_tg_backtest(message):
@@ -240,10 +257,3 @@ def run_scheduler():
         time.sleep(1)
 
 print("Запуск планировщика...")
-send_tg_message("🚀 *Бот успешно подключен к BingX спот!*")
-
-scheduler_thread = threading.Thread(target=run_scheduler)
-scheduler_thread.daemon = True
-scheduler_thread.start()
-
-bot.infinity_polling()
