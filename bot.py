@@ -35,10 +35,18 @@ sys.excepthook = handle_exception
 
 # === НАСТРОЙКИ ТОРГОВОГО БОТА ===
 EXCHANGE_NAME = 'bybit'  
-SYMBOL = 'SOL/USDT'      
 TIMEFRAME = '5m'         
 CANDLE_LIMIT = 50        
 
+# СПИСОК ИЗ 20 ТОП-МОНЕТ ДЛЯ МОНИТОРИНГА
+SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
+    'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
+    'MATIC/USDT', 'NEAR/USDT', 'UNI/USDT', 'LTC/USDT', 'APT/USDT',
+    'ARB/USDT', 'OP/USDT', 'INJ/USDT', 'TIA/USDT', 'SUI/USDT'
+]
+
+# Настройки индикаторов
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
@@ -47,44 +55,41 @@ MFI_PERIOD = 14
 MFI_OVERSOLD = 20
 MFI_OVERBOUGHT = 80
 
+# Риск-менеджмент
 TAKE_PROFIT_PCT = 0.03  
 STOP_LOSS_PCT = 0.015   
 
-# Стартовый баланс для демо-торговли
-balance = 1000.0  
-position = None   
+# Распределение виртуального баланса
+START_TOTAL_BALANCE = 1000.0
+balance_per_coin = START_TOTAL_BALANCE / len(SYMBOLS)
+
+# Словари балансов и позиций для каждой из 20 монет
+balances = {symbol: balance_per_coin for symbol in SYMBOLS}
+positions = {symbol: None for symbol in SYMBOLS}
 
 exchange = getattr(ccxt, EXCHANGE_NAME)()
 
 # --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ИНДИКАТОРОВ (ЧИСТЫЙ PYTHON) ---
 def calculate_rsi(prices, period=14):
-    """Расчет индикатора RSI"""
     deltas = pd.Series(prices).diff().dropna()
     gain = deltas.clip(lower=0)
     loss = -deltas.clip(upper=0)
-    
     avg_gain = gain.ewm(com=period-1, adjust=False).mean()
     avg_loss = loss.ewm(com=period-1, adjust=False).mean()
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi.iloc[-1]
 
 def calculate_mfi(high, low, close, volume, period=14):
-    """Расчет индикатора MFI (Money Flow Index)"""
     typical_price = (high + low + close) / 3
     money_flow = typical_price * volume
-    
     delta = typical_price.diff()
     pos_flow = pd.Series(0.0, index=typical_price.index)
     neg_flow = pd.Series(0.0, index=typical_price.index)
-    
     pos_flow[delta > 0] = money_flow[delta > 0]
     neg_flow[delta < 0] = money_flow[delta < 0]
-    
     pos_mf = pos_flow.rolling(window=period).sum()
     neg_mf = neg_flow.rolling(window=period).sum()
-    
     m_ratio = pos_mf / neg_mf
     mfi = 100 - (100 / (1 + m_ratio))
     return mfi.iloc[-1]
@@ -92,30 +97,39 @@ def calculate_mfi(high, low, close, volume, period=14):
 # --- ОБРАБОТКА КОМАНД В ТЕЛЕГРАМ ---
 @bot.message_handler(commands=['start', 'balance'])
 def send_balance(message):
-    """Ответ на команду /balance или /start"""
+    """Ответ на команду /balance"""
     if message.chat.id == CHAT_ID:
-        if position is None:
-            status_text = f"💰 *Ваш баланс:* \${balance:.2f}\nВ данный момент открытых сделок нет."
-        else:
-            current_data = get_market_data()
-            if current_data is not None:
-                current_price = current_data['close']
-                entry_price = position['entry_price']
-                profit_pct = ((current_price - entry_price) / entry_price) * 100
-                status_text = (f"📊 *Текущая сделка по {SYMBOL}:*\n"
-                               f"🔹 Цена входа: {entry_price}\n"
-                               f"🔹 Текущая цена: {current_price}\n"
-                               f"📈 Текущий профит: {profit_pct:+.2f}%\n"
-                               f"💰 Баланс в монетах: {position['amount']:.3f} SOL")
-            else:
-                status_text = "Сделка открыта, но не удалось получить цену с биржи."
+        report = "📊 *Текущий статус портфеля (Топ-20):*\n\n"
+        total_value = 0.0
+        active_trades = 0
         
-        bot.reply_to(message, status_text, parse_mode='Markdown')
+        for symbol in SYMBOLS:
+            pos = positions[symbol]
+            if pos is None:
+                total_value += balances[symbol]
+            else:
+                active_trades += 1
+                current_data = get_market_data(symbol)
+                if current_data is not None:
+                    current_price = current_data['close']
+                    entry_price = pos['entry_price']
+                    profit_pct = ((current_price - entry_price) / entry_price) * 100
+                    current_cost = pos['amount'] * current_price
+                    total_value += current_cost
+                    report += f"🔸 *{symbol}:* В сделке! Профит: {profit_pct:+.2f}% (\${current_cost:.2f})\n"
+                else:
+                    current_cost = pos['amount'] * pos['entry_price']
+                    total_value += current_cost
+                    report += f"🔸 *{symbol}:* В сделке (связь ограничена)\n"
+                    
+        report += f"\n💼 Активных сделок: {active_trades} из {len(SYMBOLS)}"
+        report += f"\n💰 *Общая стоимость активов:* \${total_value:.2f}"
+        bot.reply_to(message, report, parse_mode='Markdown')
 
-def get_market_data():
-    """Скачивание свечей и запуск функций расчета"""
+def get_market_data(symbol):
+    """Скачивание свечей для конкретной монеты"""
     try:
-        bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         rsi_val = calculate_rsi(df['close'], period=RSI_PERIOD)
@@ -126,84 +140,89 @@ def get_market_data():
         latest['MFI'] = mfi_val
         return latest
     except Exception as e:
-        print(f"Ошибка получения рыночных данных: {e}")
+        print(f"Ошибка получения данных для {symbol}: {e}")
         return None
 
 def check_trade_logic():
-    """Основная логика анализа рынка, покупки и продажи"""
-    global balance, position
+    """Последовательный обход всех 20 монет в цикле"""
+    global balances, positions
     
-    current_data = get_market_data()
-    if current_data is None:
-        return
+    for symbol in SYMBOLS:
+        current_data = get_market_data(symbol)
+        if current_data is None:
+            continue
+            
+        current_price = current_data['close']
+        rsi = current_data['RSI']
+        mfi = current_data['MFI']
         
-    current_price = current_data['close']
-    rsi = current_data['RSI']
-    mfi = current_data['MFI']
-    
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Цена: {current_price} | RSI: {rsi:.2f} | MFI: {mfi:.2f}")
+        # Печатаем логи в консоль хостинга (для контроля)
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {symbol} | Цена: {current_price} | RSI: {rsi:.2f} | MFI: {mfi:.2f}")
 
-    # Сценарий 1: Поиск точки входа
-    if position is None:
-        if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD:
-            amount_to_buy = balance / current_price
-            position = {
-                'entry_price': current_price,
-                'amount': amount_to_buy
-            }
-            balance = 0.0
+        # Сценарий 1: Ищем точку входа
+        if positions[symbol] is None:
+            if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD:
+                if balances[symbol] > 0:
+                    amount_to_buy = balances[symbol] / current_price
+                    positions[symbol] = {
+                        'entry_price': current_price,
+                        'amount': amount_to_buy
+                    }
+                    balances[symbol] = 0.0
+                    
+                    msg = (f"🛒 *СИГНАЛ НА ПОКУПКУ*\n\n"
+                           f"🔹 *Инструмент:* {symbol}\n"
+                           f"🔹 *Цена входа:* {current_price}\n"
+                           f"📊 *Индикаторы:* RSI {rsi:.1f}, MFI {mfi:.1f}")
+                    send_tg_message(msg)
+                
+        # Сценарий 2: Проверяем выход из сделки
+        else:
+            pos = positions[symbol]
+            entry_price = pos['entry_price']
+            amount = pos['amount']
+            price_change = (current_price - entry_price) / entry_price
             
-            msg = (f"🛒 *СИГНАЛ НА ПОКУПКУ*\n\n"
-                   f"🔹 *Инструмент:* {SYMBOL}\n"
-                   f"🔹 *Цена входа:* {current_price}\n"
-                   f"📊 *Индикаторы:* RSI {rsi:.1f}, MFI {mfi:.1f}\n"
-                   f"💰 *Объем сделки:* {amount_to_buy:.3f} SOL")
-            send_tg_message(msg)
+            is_take_profit = price_change >= TAKE_PROFIT_PCT
+            is_stop_loss = price_change <= -STOP_LOSS_PCT
+            is_overbought = rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT
             
-    # Сценарий 2: Проверка выхода из сделки
-    else:
-        entry_price = position['entry_price']
-        amount = position['amount']
-        price_change = (current_price - entry_price) / entry_price
+            if is_take_profit or is_stop_loss or is_overbought:
+                balances[symbol] = amount * current_price
+                
+                if is_take_profit:
+                    reason = "🟢 Take-Profit"
+                elif is_stop_loss:
+                    reason = "🔴 Stop-Loss"
+                else:
+                    reason = "🟡 Перекупленность рынка"
+                
+                msg = (f"💰 *СИГНАЛ НА ПРОДАЖУ*\n\n"
+                       f"🔹 *Монета:* {symbol}\n"
+                       f"🔹 *Причина:* {reason}\n"
+                       f"🔹 *Цена выхода:* {current_price}\n"
+                       f"📈 *Результат:* {price_change*100:+.2f}%\n"
+                       f"💵 *Баланс пары:* \${balances[symbol]:.2f}")
+                send_tg_message(msg)
+                positions[symbol] = None
         
-        is_take_profit = price_change >= TAKE_PROFIT_PCT
-        is_stop_loss = price_change <= -STOP_LOSS_PCT
-        is_overbought = rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT
-        
-        if is_take_profit or is_stop_loss or is_overbought:
-            balance = amount * current_price
-            
-            if is_take_profit:
-                reason = "🟢 Take-Profit"
-            elif is_stop_loss:
-                reason = "🔴 Stop-Loss"
-            else:
-                reason = "🟡 Перекупленность рынка"
-            
-            msg = (f"💰 *СИГНАЛ НА ПРОДАЖУ*\n\n"
-                   f"🔹 *Причина:* {reason}\n"
-                   f"🔹 *Цена выхода:* {current_price}\n"
-                   f"📈 *Результат:* {price_change*100:+.2f}%\n"
-                   f"💵 *Текущий баланс:* \${balance:.2f}")
-            send_tg_message(msg)
-            position = None
+        # Небольшая пауза между запросами к API биржи, чтобы Bybit не заблокировал за спам
+        time.sleep(0.5)
 
 def run_scheduler():
-    """Запуск планировщика в отдельном потоке"""
     schedule.every(1).minutes.do(check_trade_logic)
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-# Приветственное сообщение владельцу
-send_tg_message("🤖 *Крипто-бот успешно запущен на хостинге!*\nСтратегия RSI + MFI (Pure Math) активирована в демо-режиме.\n\nИспользуйте команду `/balance` для проверки.")
+# Приветственное сообщение
+send_tg_message(f"🚀 *Мультивалютный ИИ-скальпер запущен!*\nВ мониторинг добавлено 20 ТОП-монет.\nНа каждую выделен демо-лимит: \${balance_per_coin:.2f}")
 
-# Запуск торговой логики
+# Запуск потоков
 scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.daemon = True
 scheduler_thread.start()
 
-# Запуск прослушивания сообщений Telegram
 try:
     bot.infinity_polling()
 except Exception as e:
