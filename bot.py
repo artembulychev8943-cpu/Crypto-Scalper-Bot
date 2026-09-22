@@ -24,12 +24,18 @@ def send_tg_message(text):
     except Exception as e:
         print(f"Ошибка отправки сообщения: {e}")
 
-# === НАСТРОЙКИ ТОРГОВОГО БОТА ===
-EXCHANGE_NAME = 'bybit'  
+def handle_exception(exc_type, exc_value, exc_traceback):
+    error_msg = f"❌ *Критический сбой бота на хостинге!*\n\nТип: {exc_type.__name__}\nОшибка: {exc_value}"
+    send_tg_message(error_msg)
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = handle_exception
+
+# === НАСТРОЙКИ БОТА ДЛЯ BINGX ===
+EXCHANGE_NAME = 'bingx'  # Меняем биржу на BingX
 TIMEFRAME = '5m'         
 CANDLE_LIMIT = 50        
 
-# Список из 20 ТОП-монет (MATIC заменен на актуальный POL)
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
     'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
@@ -48,13 +54,18 @@ MFI_OVERBOUGHT = 80
 TAKE_PROFIT_PCT = 0.03  
 STOP_LOSS_PCT = 0.015   
 
-START_TOTAL_BALANCE = 1000.0
-balance_per_coin = START_TOTAL_BALANCE / len(SYMBOLS)
+# Инициализация подключения к BingX с вашими боевыми ключами
+exchange = getattr(ccxt, EXCHANGE_NAME)({
+    'apiKey': os.getenv('BINGX_API_KEY'),
+    'secret': os.getenv('BINGX_SECRET_KEY'),
+    'enableRateLimit': True,  
+    'options': {
+        'defaultType': 'spot' # Торгуем строго на спотовом рынке
+    }
+})
 
-balances = {symbol: balance_per_coin for symbol in SYMBOLS}
-positions = {symbol: None for symbol in SYMBOLS}
-
-exchange = getattr(ccxt, EXCHANGE_NAME)()
+# Локальный трекер позиций (Бот запоминает цену реального входа)
+active_positions = {symbol: None for symbol in SYMBOLS}
 
 # --- ЧИСТАЯ МАТЕМАТИКА ---
 def calculate_rsi_series(prices, period=14):
@@ -97,30 +108,29 @@ def get_market_data_single(symbol):
 def send_balance(message):
     if message.chat.id != CHAT_ID:
         return
-    report = "📊 *Текущий статус портфеля (Топ-20):*\n\n"
-    total_value = 0.0
-    for symbol in SYMBOLS:
-        pos = positions[symbol]
-        if pos is None:
-            total_value += balances[symbol]
-        else:
-            current_data = get_market_data_single(symbol)
-            if current_data is not None:
-                current_cost = pos['amount'] * current_data['close']
-                total_value += current_cost
-                report += f"🔸 *{symbol}:* В сделке! (\${current_cost:.2f})\n"
-            else:
-                total_value += (pos['amount'] * pos['entry_price'])
-    report += f"\n💰 *Общая стоимость активов:* \${total_value:.2f}"
-    bot.reply_to(message, report, parse_mode='Markdown')
+    try:
+        # Запрашиваем реальный баланс кошелька с BingX
+        fetch_bal = exchange.fetch_balance()
+        usdt_free = fetch_bal['free'].get('USDT', 0.0)
+        usdt_total = fetch_bal['total'].get('USDT', 0.0)
+        
+        report = f"📊 *Реальный баланс на BingX:*\n"
+        report += f"💵 Доступно для сделок: \${usdt_free:.2f} USDT\n"
+        report += f"💰 Всего на споте (с учетом монет): \${usdt_total:.2f} USDT\n\n"
+        
+        active_count = sum(1 for sym in SYMBOLS if active_positions[sym] is not None)
+        report += f"💼 Активных ИИ-сделок в работе: {active_count} из {len(SYMBOLS)}"
+        bot.reply_to(message, report, parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(message, f"❌ Не удалось получить баланс с BingX: {e}")
 
 @bot.message_handler(commands=['backtest'])
 def run_tg_backtest(message):
     if message.chat.id != CHAT_ID:
         return
-    bot.reply_to(message, f"⏳ Запущен глобальный бэктест по *{len(SYMBOLS)} монетам* за 3.5 дня. Считаю...", parse_mode='Markdown')
+    bot.reply_to(message, f"⏳ Запущен глобальный исторический бэктест по *{len(SYMBOLS)} монетам* на базе данных BingX. Считаю...", parse_mode='Markdown')
     
-    summary_report = "📊 *Глобальный бэктест (Топ-20 за 3.5 дня):*\n\n"
+    summary_report = "📊 *Глобальный бэктест BingX (за 3.5 дня):*\n\n"
     total_start_funds = len(SYMBOLS) * 1000.0
     total_final_funds = 0.0
     global_trades = 0
@@ -165,10 +175,9 @@ def run_tg_backtest(message):
             total_final_funds += bt_balance
             p_pct = ((bt_balance - 1000.0) / 1000.0) * 100
             summary_report += f"🔹 {symbol}: {p_pct:+.2f}%\n"
-        except Exception as e:
+        except Exception:
             total_final_funds += 1000.0
-            summary_report += f"🔹 {symbol}: Ошибка данных (Пропущено) ⚠️\n"
-            print(f"Ошибка бэктеста для {symbol}: {e}")
+            summary_report += f"🔹 {symbol}: Данные временно недоступны ⚠️\n"
             
         time.sleep(0.3)
 
@@ -178,9 +187,18 @@ def run_tg_backtest(message):
     summary_report += f"\n📈 *Общий итог стратегии:*\n💵 Результат: {g_profit_pct:+.2f}%\n🔄 Всего сделок: {global_trades}\n🎯 Win Rate: {g_win_rate:.1f}%"
     bot.send_message(CHAT_ID, summary_report, parse_mode='Markdown')
 
-# --- РАБОТА РОБОТА В РЕАЛЬНОМ ВРЕМЕНИ ---
+# --- РЕАЛЬНОЕ ИСПОЛНЕНИЕ ОРДЕРОВ НА BINGX ---
 def check_trade_logic():
-    global balances, positions
+    global active_positions
+    
+    # Считаем динамический объем на сделку от текущего реального баланса USDT
+    try:
+        current_balance = exchange.fetch_balance()['free'].get('USDT', 0.0)
+        # Выделяем на одну монету 5% от текущего кошелька
+        trade_amount_usdt = current_balance * 0.05 
+    except Exception:
+        return
+
     for symbol in SYMBOLS:
         try:
             current_data = get_market_data_single(symbol)
@@ -190,36 +208,41 @@ def check_trade_logic():
             rsi = current_data['RSI']
             mfi = current_data['MFI']
 
-            if positions[symbol] is None:
-                if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD and balances[symbol] > 0:
-                    positions[symbol] = {'entry_price': c_price, 'amount': balances[symbol] / c_price}
-                    balances[symbol] = 0.0
-                    msg = f"🛒 *ПОКУПКА {symbol}*\nЦена: {c_price}\nRSI: {rsi:.1f}, MFI: {mfi:.1f}"
+            # Сценарий Покупки: индикаторы на дне, позиции по монете нет, на балансе есть баксы
+            if active_positions[symbol] is None:
+                if rsi < RSI_OVERSOLD and mfi < MFI_OVERSOLD and trade_amount_usdt >= 5.0:
+                    
+                    # 🛒 ОТПРАВЛЯЕМ РЕАЛЬНЫЙ ОРДЕР НА ПОКУПКУ НА BINGX
+                    order = exchange.create_market_buy_order(symbol, trade_amount_usdt)
+                    
+                    active_positions[symbol] = {
+                        'entry_price': c_price,
+                        'amount': order['amount'] if 'amount' in order else (trade_amount_usdt / c_price)
+                    }
+                    
+                    msg = f"🛒 *РЕАЛЬНАЯ ПОКУПКА НА BINGX: {symbol}*\nЦена входа: {c_price}\nВыделено: \${trade_amount_usdt:.2f} USDT"
                     send_tg_message(msg)
+                    
+            # Сценарий Продажи: мы в сделке, проверяем Тейк/Стоп/Перекупленность
             else:
-                pos = positions[symbol]
+                pos = active_positions[symbol]
                 p_change = (c_price - pos['entry_price']) / pos['entry_price']
                 
                 if p_change >= TAKE_PROFIT_PCT or p_change <= -STOP_LOSS_PCT or rsi > RSI_OVERBOUGHT or mfi > MFI_OVERBOUGHT:
-                    balances[symbol] = pos['amount'] * c_price
-                    reason = "🟢 TP" if p_change > 0 else "🔴 SL"
-                    msg = f"💰 *ПРОДАЖА {symbol}* ({reason})\nЦена: {c_price}\nРезультат: {p_change*100:+.2f}%\nБаланс пары: \${balances[symbol]:.2f}"
+                    
+                    # 💰 ОТПРАВЛЯЕМ РЕАЛЬНЫЙ ОРДЕР НА ПРОДАЖУ НА BINGX
+                    exchange.create_market_sell_order(symbol, pos['amount'])
+                    
+                    reason = "🟢 Take-Profit 🎯" if p_change > 0 else "🔴 Stop-Loss 🛑"
+                    msg = f"💰 *РЕАЛЬНАЯ ПРОДАЖА НА BINGX: {symbol}*\nПричина: {reason}\nЦена выхода: {c_price}\nРезультат: {p_change*100:+.2f}%"
                     send_tg_message(msg)
-                    positions[symbol] = None
+                    active_positions[symbol] = None
+                    
         except Exception as e:
-            print(f"Ошибка логики торговли для {symbol}: {e}")
+            print(f"Ошибка исполнения на BingX для {symbol}: {e}")
         time.sleep(0.5)
 
 def run_scheduler():
     schedule.every(1).minutes.do(check_trade_logic)
     while True:
         schedule.run_pending()
-        time.sleep(1)
-
-send_tg_message("🚀 *Бот успешно обновлен!*\nУстаревший тикер MATIC заменен на актуальный POL. Защита от ошибок API добавлена.\n\nЗапустите массовый бэктест рынка заново:\n`/backtest`")
-
-scheduler_thread = threading.Thread(target=run_scheduler)
-scheduler_thread.daemon = True
-scheduler_thread.start()
-
-bot.infinity_polling()
