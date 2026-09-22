@@ -135,10 +135,7 @@ def handle_interface_buttons(message):
             
             active_count = sum(1 for sym in SYMBOLS if active_positions[sym] is not None)
             
-            report = f"📊 *Реальный баланс Спота BingX:*\n" \
-                     f"💵 Свободно для ИИ: \${usdt_free:.2f} USDT\n" \
-                     f"💰 Всего на кошельке: \${usdt_total:.2f} USDT\n\n" \
-                     f"💼 Активных ИИ-сделок: {active_count} из {len(SYMBOLS)}"
+            report = f"📊 *Реальный баланс Спота BingX:*\n💵 Свободно для ИИ: \${usdt_free:.2f} USDT\n💰 Всего на кошельке: \${usdt_total:.2f} USDT\n\n💼 Активных ИИ-сделок: {active_count} из {len(SYMBOLS)}"
             bot.reply_to(message, report, parse_mode='Markdown')
         except Exception as e:
             bot.reply_to(message, f"❌ Ошибка запроса баланса к BingX: {e}")
@@ -220,7 +217,7 @@ def handle_interface_buttons(message):
 
 # --- РАБОТА РОБОТА В РЕАЛЬНОМ ВРЕМЕНИ ---
 def check_trade_logic():
-    global balances, positions
+    global balances, positions, active_positions
     for symbol in SYMBOLS:
         try:
             current_data = get_market_data_single(symbol)
@@ -238,4 +235,5 @@ def check_trade_logic():
                     amount_usdt = bal * 0.05
                     if amount_usdt >= 5.0:
                         order = exchange.create_market_buy_order(symbol, amount_usdt)
-                        active_positions[symbol] = {
+                        
+                        # ЛИНЕЙНЫЙ БЕЗОШИБОЧНЫЙ СИНТАКСИС ЗАПИСИ
